@@ -1,0 +1,76 @@
+services:
+
+  # ── Base de datos PostgreSQL ─────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    container_name: casino_db
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      # Named volume: los datos sobreviven a "docker rm" del contenedor
+      - pg_data:/var/lib/postgresql/data
+      # Script de inicialización — solo corre si el volumen está VACÍO (primer arranque)
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    networks:
+      - casino_net
+    restart: unless-stopped
+
+  # ── Backend Node.js + Express ────────────────────────────────────────────────
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: casino_backend
+    environment:
+      PORT: ${PORT:-3000}
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-8h}
+      DB_HOST: db          # nombre del servicio, NO "localhost"
+      DB_PORT: ${DB_PORT:-5432}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      CORS_ORIGIN: ${CORS_ORIGIN:-*}
+    # Sin ports: el backend NO es accesible desde fuera de la red Docker
+    # Solo el frontend (dentro de casino_net) puede llamarlo
+    depends_on:
+      db:
+        condition: service_healthy   # espera que pg_isready responda OK
+    networks:
+      - casino_net
+    restart: unless-stopped
+
+  # ── Frontend Angular + Nginx ─────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ../frontend_intro_devops_casino
+      dockerfile: Dockerfile
+    container_name: casino_frontend
+    ports:
+      - "80:8080"   # Nginx corre en 8080 interno (nginx-unprivileged sin root)
+      # mapeado al 80 del host → accesible en http://localhost
+    depends_on:
+      - backend
+    networks:
+      - casino_net
+    restart: unless-stopped
+
+# ── Volúmenes ────────────────────────────────────────────────────────────────
+volumes:
+  pg_data:
+  # Named volume: gestionado por Docker, no depende de rutas absolutas del host.
+  # Elegido sobre bind mount porque: (1) portátil entre máquinas, (2) no expone
+  # rutas del sistema operativo, (3) Docker lo gestiona automáticamente en EC2.
+
+# ── Redes ────────────────────────────────────────────────────────────────────
+networks:
+  casino_net:
+    driver: bridge
