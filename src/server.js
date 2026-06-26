@@ -23,15 +23,18 @@ app.use(express.json({ limit: '1mb' }));
 // /health — endpoint de salud que verifica la conexión a la BD.
 // Docker usa este endpoint en HEALTHCHECK; también lo utilizan ALB/ELB en AWS
 // y los pipelines de CI/CD para saber si el servicio está listo para recibir tráfico.
-app.get('/health', async (req, res) => {
-  try {
-    await pool.query('SELECT 1');
-    res.json({ status: 'ok', db: 'up', uptime: process.uptime() });
-  } catch (err) {
-    res.status(503).json({ status: 'degraded', db: 'down', error: err.message });
-  }
+app.get('/livez', (req, res) => {
+  res.json({ status: 'alive', uptime: process.uptime() });
 });
 
+app.get('/readyz', async (req, res) => {
+  try {
+    await pool.query('SELECT 1');
+    res.json({ status: 'ready', db: 'up' });
+  } catch (err) {
+    res.status(503).json({ status: 'not-ready', db: 'down', error: err.message });
+  }
+});
 // Bienvenida
 app.get('/', (req, res) => {
   res.json({
