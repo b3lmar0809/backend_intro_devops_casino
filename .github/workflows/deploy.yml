@@ -1,23 +1,27 @@
-name: Deploy Backend
+name: CI/CD - casino-backend (build/push -> deploy)
 
 on:
   push:
-    branches:
-      - deploy
+    branches: [ deploy ]
+  workflow_dispatch:
 
 env:
   AWS_REGION: us-east-1
-  ECR_REPOSITORY: casino-backend
+  CLUSTER_NAME: casino-eks
+  SERVICE_NAME: casino-backend
+  IMAGE_VERSION: v1.0.0
 
 jobs:
-  build-push-deploy:
-    name: Build, Push and Deploy
+  build-push:
     runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ github.sha }}
+      registry: ${{ steps.ecr.outputs.registry }}
     steps:
-      - name: Checkout code
+      - name: 1. Descargar el codigo del repo
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials
+      - name: 2. Configurar credenciales de AWS (temporales del lab)
         uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -25,35 +29,57 @@ jobs:
           aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
+      - name: 3. Login en Amazon ECR
+        id: ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, tag and push image to ECR
-        id: build-image
+      - name: 4. Build y push (3 tags - vX.Y.Z, latest, sha)
         env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: v1.0.${{ github.run_number }}
+          REGISTRY: ${{ steps.ecr.outputs.registry }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest -t $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }} .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:${{ github.sha }}
-          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          docker build \
+            -t "$REGISTRY/$SERVICE_NAME:$IMAGE_VERSION" \
+            -t "$REGISTRY/$SERVICE_NAME:latest" \
+            -t "$REGISTRY/$SERVICE_NAME:${{ github.sha }}" \
+            .
+          docker push "$REGISTRY/$SERVICE_NAME:$IMAGE_VERSION"
+          docker push "$REGISTRY/$SERVICE_NAME:latest"
+          docker push "$REGISTRY/$SERVICE_NAME:${{ github.sha }}"
 
-      - name: Deploy to EC2 backend via SSM
-        env:
-          IMAGE: ${{ steps.build-image.outputs.image }}
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-push
+    steps:
+      - name: 1. Descargar el codigo del repo
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar credenciales de AWS (temporales del lab)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: 3. Instalar kubectl
         run: |
-          aws ssm send-command \
-            --instance-ids i-0552d1d6e31ae95d0 \
-            --document-name "AWS-RunShellScript" \
-            --parameters commands="[
-              'aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${{ secrets.ECR_REGISTRY }}',
-              'docker pull ${{ env.IMAGE }}',
-              'docker stop casino_backend || true',
-              'docker rm casino_backend || true',
-              'docker network create casino_net || true',
-              'docker run -d --name casino_backend --network casino_net -e PORT=3000 -e JWT_SECRET=${{ secrets.JWT_SECRET }} -e DB_HOST=casino_db -e DB_PORT=5432 -e DB_USER=${{ secrets.DB_USER }} -e DB_PASSWORD=${{ secrets.DB_PASSWORD }} -e DB_NAME=${{ secrets.DB_NAME }} ${{ env.IMAGE }}'
-            ]" \
-            --region us-east-1
+          curl -LO "https://dl.k8s.io/release/$(curl -L -s https://dl.k8s.io/release/stable.txt)/bin/linux/amd64/kubectl"
+          chmod +x kubectl
+          sudo mv kubectl /usr/local/bin/kubectl
+
+      - name: 4. Conectar kubectl al cluster EKS
+        run: aws eks update-kubeconfig --name "$CLUSTER_NAME" --region "$AWS_REGION"
+
+      - name: 5. Desplegar en EKS
+        env:
+          REGISTRY: ${{ needs.build-push.outputs.registry }}
+          IMAGE_TAG: ${{ needs.build-push.outputs.image_tag }}
+        run: |
+          sed -i "s|<ACCOUNT_ID>.dkr.ecr.<REGION>.amazonaws.com|$REGISTRY|g; s|:latest|:$IMAGE_TAG|g" k8s/deployment.yaml
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+
+      - name: 6. Verificar el rollout
+        run: |
+          kubectl rollout status deployment/$SERVICE_NAME --timeout=180s
+          kubectl get pods -l app=$SERVICE_NAME -o wide
